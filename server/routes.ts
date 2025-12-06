@@ -1,6 +1,7 @@
 import type { Express } from "express";
 import { createServer, type Server } from "http";
 import { storage } from "./storage";
+import { setupAuth, isAuthenticated } from "./replitAuth";
 import { z } from "zod";
 
 const tradeSchema = z.object({
@@ -20,7 +21,27 @@ export async function registerRoutes(
   app: Express
 ): Promise<Server> {
   
-  // Get all cryptocurrencies
+  // Setup authentication
+  await setupAuth(app);
+
+  // Auth user endpoint
+  app.get("/api/auth/user", (req, res) => {
+    if (req.isAuthenticated() && req.user) {
+      const claims = (req.user as any).claims;
+      if (claims) {
+        return res.json({
+          id: claims.sub,
+          email: claims.email,
+          firstName: claims.first_name,
+          lastName: claims.last_name,
+          profileImageUrl: claims.profile_image_url,
+        });
+      }
+    }
+    res.status(401).json({ message: "Not authenticated" });
+  });
+
+  // Get all cryptocurrencies (public)
   app.get("/api/cryptocurrencies", async (req, res) => {
     try {
       const cryptos = await storage.getAllCryptos();
@@ -30,7 +51,7 @@ export async function registerRoutes(
     }
   });
 
-  // Get single cryptocurrency
+  // Get single cryptocurrency (public)
   app.get("/api/cryptocurrencies/:id", async (req, res) => {
     try {
       const crypto = await storage.getCrypto(req.params.id);
@@ -43,29 +64,32 @@ export async function registerRoutes(
     }
   });
 
-  // Get portfolio summary
-  app.get("/api/portfolio", async (req, res) => {
+  // Get portfolio summary (protected)
+  app.get("/api/portfolio", isAuthenticated, async (req, res) => {
     try {
-      const portfolio = await storage.getPortfolio();
+      const userId = (req.user as any).claims.sub;
+      const portfolio = await storage.getPortfolio(userId);
       res.json(portfolio);
     } catch (error) {
       res.status(500).json({ error: "Failed to fetch portfolio" });
     }
   });
 
-  // Get USD balance
-  app.get("/api/balance", async (req, res) => {
+  // Get USD balance (protected)
+  app.get("/api/balance", isAuthenticated, async (req, res) => {
     try {
-      const balance = await storage.getUsdBalance();
+      const userId = (req.user as any).claims.sub;
+      const balance = await storage.getUsdBalance(userId);
       res.json(balance);
     } catch (error) {
       res.status(500).json({ error: "Failed to fetch balance" });
     }
   });
 
-  // Execute trade (buy/sell)
-  app.post("/api/trade", async (req, res) => {
+  // Execute trade (buy/sell) (protected)
+  app.post("/api/trade", isAuthenticated, async (req, res) => {
     try {
+      const userId = (req.user as any).claims.sub;
       const parsed = tradeSchema.safeParse(req.body);
       if (!parsed.success) {
         return res.status(400).json({ error: "Invalid trade data" });
@@ -83,18 +107,19 @@ export async function registerRoutes(
 
       if (type === "buy") {
         const totalWithFee = totalValue + fee;
-        const balance = await storage.getUsdBalance();
+        const balance = await storage.getUsdBalance(userId);
         
         if (totalWithFee > balance) {
           return res.status(400).json({ error: "Insufficient funds" });
         }
 
         // Update balance and holdings
-        await storage.updateUsdBalance(-totalWithFee);
-        await storage.updateHolding(cryptoId, amount, crypto.currentPrice);
+        await storage.updateUsdBalance(userId, -totalWithFee);
+        await storage.updateHolding(userId, cryptoId, amount, crypto.currentPrice);
 
         // Create transaction
         await storage.createTransaction({
+          userId,
           type: "buy",
           toCryptoId: cryptoId,
           toSymbol: crypto.symbol,
@@ -111,7 +136,7 @@ export async function registerRoutes(
 
       } else {
         // Sell
-        const holding = await storage.getWalletHolding(cryptoId);
+        const holding = await storage.getWalletHolding(userId, cryptoId);
         
         if (!holding || holding.amount < amount) {
           return res.status(400).json({ error: "Insufficient holdings" });
@@ -120,11 +145,12 @@ export async function registerRoutes(
         const totalAfterFee = totalValue - fee;
 
         // Update balance and holdings
-        await storage.updateUsdBalance(totalAfterFee);
-        await storage.updateHolding(cryptoId, -amount, 0);
+        await storage.updateUsdBalance(userId, totalAfterFee);
+        await storage.updateHolding(userId, cryptoId, -amount, 0);
 
         // Create transaction
         await storage.createTransaction({
+          userId,
           type: "sell",
           fromCryptoId: cryptoId,
           fromSymbol: crypto.symbol,
@@ -147,9 +173,10 @@ export async function registerRoutes(
     }
   });
 
-  // Convert crypto
-  app.post("/api/convert", async (req, res) => {
+  // Convert crypto (protected)
+  app.post("/api/convert", isAuthenticated, async (req, res) => {
     try {
+      const userId = (req.user as any).claims.sub;
       const parsed = convertSchema.safeParse(req.body);
       if (!parsed.success) {
         return res.status(400).json({ error: "Invalid conversion data" });
@@ -164,7 +191,7 @@ export async function registerRoutes(
         return res.status(404).json({ error: "Cryptocurrency not found" });
       }
 
-      const holding = await storage.getWalletHolding(fromCryptoId);
+      const holding = await storage.getWalletHolding(userId, fromCryptoId);
       
       if (!holding || holding.amount < fromAmount) {
         return res.status(400).json({ error: "Insufficient holdings" });
@@ -177,12 +204,13 @@ export async function registerRoutes(
       const finalToAmount = toAmount - fee;
 
       // Update holdings
-      await storage.updateHolding(fromCryptoId, -fromAmount, 0);
-      await storage.updateHolding(toCryptoId, finalToAmount, toCrypto.currentPrice);
+      await storage.updateHolding(userId, fromCryptoId, -fromAmount, 0);
+      await storage.updateHolding(userId, toCryptoId, finalToAmount, toCrypto.currentPrice);
 
       // Create transaction (fee is in toCrypto units, convert to USD for storage)
       const feeInUsd = fee * toCrypto.currentPrice;
       await storage.createTransaction({
+        userId,
         type: "convert",
         fromCryptoId,
         fromSymbol: fromCrypto.symbol,
@@ -204,30 +232,33 @@ export async function registerRoutes(
     }
   });
 
-  // Get all transactions
-  app.get("/api/transactions", async (req, res) => {
+  // Get all transactions (protected)
+  app.get("/api/transactions", isAuthenticated, async (req, res) => {
     try {
-      const transactions = await storage.getAllTransactions();
+      const userId = (req.user as any).claims.sub;
+      const transactions = await storage.getAllTransactions(userId);
       res.json(transactions);
     } catch (error) {
       res.status(500).json({ error: "Failed to fetch transactions" });
     }
   });
 
-  // Get settings
-  app.get("/api/settings", async (req, res) => {
+  // Get settings (protected)
+  app.get("/api/settings", isAuthenticated, async (req, res) => {
     try {
-      const settings = await storage.getSettings();
+      const userId = (req.user as any).claims.sub;
+      const settings = await storage.getSettings(userId);
       res.json(settings);
     } catch (error) {
       res.status(500).json({ error: "Failed to fetch settings" });
     }
   });
 
-  // Update settings
-  app.patch("/api/settings", async (req, res) => {
+  // Update settings (protected)
+  app.patch("/api/settings", isAuthenticated, async (req, res) => {
     try {
-      const settings = await storage.updateSettings(req.body);
+      const userId = (req.user as any).claims.sub;
+      const settings = await storage.updateSettings(userId, req.body);
       res.json(settings);
     } catch (error) {
       res.status(500).json({ error: "Failed to update settings" });
