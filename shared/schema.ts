@@ -1,8 +1,42 @@
-import { pgTable, text, varchar, real, timestamp, boolean } from "drizzle-orm/pg-core";
+import { sql } from 'drizzle-orm';
+import { pgTable, text, varchar, real, timestamp, boolean, index, jsonb } from "drizzle-orm/pg-core";
 import { createInsertSchema } from "drizzle-zod";
 import { z } from "zod";
 
-// Cryptocurrency definitions
+// Session storage table (required for Replit Auth)
+export const sessions = pgTable(
+  "sessions",
+  {
+    sid: varchar("sid").primaryKey(),
+    sess: jsonb("sess").notNull(),
+    expire: timestamp("expire").notNull(),
+  },
+  (table) => [index("IDX_session_expire").on(table.expire)],
+);
+
+// User storage table (required for Replit Auth)
+export const users = pgTable("users", {
+  id: varchar("id").primaryKey().default(sql`gen_random_uuid()`),
+  email: varchar("email").unique(),
+  firstName: varchar("first_name"),
+  lastName: varchar("last_name"),
+  profileImageUrl: varchar("profile_image_url"),
+  createdAt: timestamp("created_at").defaultNow(),
+  updatedAt: timestamp("updated_at").defaultNow(),
+});
+
+export type UpsertUser = typeof users.$inferInsert;
+export type User = typeof users.$inferSelect;
+
+// USD Balance per user
+export const usdBalances = pgTable("usd_balances", {
+  userId: varchar("user_id").primaryKey().references(() => users.id),
+  balance: real("balance").notNull().default(10000),
+});
+
+export type UsdBalance = typeof usdBalances.$inferSelect;
+
+// Cryptocurrency definitions (shared/cached data)
 export const cryptocurrencies = pgTable("cryptocurrencies", {
   id: varchar("id", { length: 50 }).primaryKey(),
   symbol: varchar("symbol", { length: 20 }).notNull(),
@@ -15,15 +49,17 @@ export const cryptocurrencies = pgTable("cryptocurrencies", {
   high24h: real("high_24h").notNull(),
   low24h: real("low_24h").notNull(),
   image: text("image"),
+  updatedAt: timestamp("updated_at").defaultNow(),
 });
 
 export const insertCryptoSchema = createInsertSchema(cryptocurrencies);
 export type InsertCrypto = z.infer<typeof insertCryptoSchema>;
 export type Cryptocurrency = typeof cryptocurrencies.$inferSelect;
 
-// Wallet holdings
+// Wallet holdings (per user)
 export const walletHoldings = pgTable("wallet_holdings", {
   id: varchar("id", { length: 50 }).primaryKey(),
+  userId: varchar("user_id").notNull().references(() => users.id),
   cryptoId: varchar("crypto_id", { length: 50 }).notNull(),
   symbol: varchar("symbol", { length: 20 }).notNull(),
   name: text("name").notNull(),
@@ -35,10 +71,11 @@ export const insertWalletHoldingSchema = createInsertSchema(walletHoldings).omit
 export type InsertWalletHolding = z.infer<typeof insertWalletHoldingSchema>;
 export type WalletHolding = typeof walletHoldings.$inferSelect;
 
-// Transactions
+// Transactions (per user)
 export const transactions = pgTable("transactions", {
   id: varchar("id", { length: 50 }).primaryKey(),
-  type: varchar("type", { length: 20 }).notNull(), // 'buy', 'sell', 'convert'
+  userId: varchar("user_id").notNull().references(() => users.id),
+  type: varchar("type", { length: 20 }).notNull(),
   fromCryptoId: varchar("from_crypto_id", { length: 50 }),
   fromSymbol: varchar("from_symbol", { length: 20 }),
   fromAmount: real("from_amount"),
@@ -48,7 +85,7 @@ export const transactions = pgTable("transactions", {
   priceAtTransaction: real("price_at_transaction").notNull(),
   totalValue: real("total_value").notNull(),
   fee: real("fee").notNull(),
-  status: varchar("status", { length: 20 }).notNull(), // 'completed', 'pending', 'failed'
+  status: varchar("status", { length: 20 }).notNull(),
   timestamp: timestamp("timestamp").notNull(),
 });
 
@@ -56,9 +93,9 @@ export const insertTransactionSchema = createInsertSchema(transactions).omit({ i
 export type InsertTransaction = z.infer<typeof insertTransactionSchema>;
 export type Transaction = typeof transactions.$inferSelect;
 
-// User settings
+// User settings (per user)
 export const userSettings = pgTable("user_settings", {
-  id: varchar("id", { length: 50 }).primaryKey(),
+  userId: varchar("user_id").primaryKey().references(() => users.id),
   currency: varchar("currency", { length: 10 }).notNull().default("USD"),
   theme: varchar("theme", { length: 20 }).notNull().default("dark"),
   priceAlerts: boolean("price_alerts").notNull().default(true),
@@ -67,9 +104,45 @@ export const userSettings = pgTable("user_settings", {
   twoFactorEnabled: boolean("two_factor_enabled").notNull().default(false),
 });
 
-export const insertSettingsSchema = createInsertSchema(userSettings).omit({ id: true });
+export const insertSettingsSchema = createInsertSchema(userSettings);
 export type InsertSettings = z.infer<typeof insertSettingsSchema>;
 export type UserSettings = typeof userSettings.$inferSelect;
+
+// Price alerts (per user)
+export const priceAlerts = pgTable("price_alerts", {
+  id: varchar("id", { length: 50 }).primaryKey(),
+  userId: varchar("user_id").notNull().references(() => users.id),
+  cryptoId: varchar("crypto_id", { length: 50 }).notNull(),
+  symbol: varchar("symbol", { length: 20 }).notNull(),
+  targetPrice: real("target_price").notNull(),
+  condition: varchar("condition", { length: 10 }).notNull(), // 'above' or 'below'
+  isActive: boolean("is_active").notNull().default(true),
+  triggered: boolean("triggered").notNull().default(false),
+  createdAt: timestamp("created_at").defaultNow(),
+});
+
+export const insertPriceAlertSchema = createInsertSchema(priceAlerts).omit({ id: true });
+export type InsertPriceAlert = z.infer<typeof insertPriceAlertSchema>;
+export type PriceAlert = typeof priceAlerts.$inferSelect;
+
+// Limit orders (per user)
+export const limitOrders = pgTable("limit_orders", {
+  id: varchar("id", { length: 50 }).primaryKey(),
+  userId: varchar("user_id").notNull().references(() => users.id),
+  cryptoId: varchar("crypto_id", { length: 50 }).notNull(),
+  symbol: varchar("symbol", { length: 20 }).notNull(),
+  type: varchar("type", { length: 10 }).notNull(), // 'buy' or 'sell'
+  orderType: varchar("order_type", { length: 20 }).notNull(), // 'limit', 'stop_loss'
+  amount: real("amount").notNull(),
+  targetPrice: real("target_price").notNull(),
+  status: varchar("status", { length: 20 }).notNull().default("pending"), // 'pending', 'executed', 'cancelled'
+  createdAt: timestamp("created_at").defaultNow(),
+  executedAt: timestamp("executed_at"),
+});
+
+export const insertLimitOrderSchema = createInsertSchema(limitOrders).omit({ id: true });
+export type InsertLimitOrder = z.infer<typeof insertLimitOrderSchema>;
+export type LimitOrder = typeof limitOrders.$inferSelect;
 
 // Price history for charts
 export interface PricePoint {
@@ -79,7 +152,7 @@ export interface PricePoint {
 
 export interface PriceHistory {
   cryptoId: string;
-  interval: string; // '1H', '24H', '7D', '30D', '1Y'
+  interval: string;
   data: PricePoint[];
 }
 
@@ -104,18 +177,3 @@ export interface ConvertRequest {
   toCryptoId: string;
   fromAmount: number;
 }
-
-// Users table (keeping from original)
-export const users = pgTable("users", {
-  id: varchar("id").primaryKey(),
-  username: text("username").notNull().unique(),
-  password: text("password").notNull(),
-});
-
-export const insertUserSchema = createInsertSchema(users).pick({
-  username: true,
-  password: true,
-});
-
-export type InsertUser = z.infer<typeof insertUserSchema>;
-export type User = typeof users.$inferSelect;
